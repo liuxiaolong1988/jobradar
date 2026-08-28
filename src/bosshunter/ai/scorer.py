@@ -735,9 +735,10 @@ def score_jobs(
             console.print("[red]无法读取简历文件[/red]")
             return 0, 0
 
-        # 画像模式：存在 profile_template.json 时注入（否则走 legacy 简历匹配）
-        data_dir = Path(config.get("_data_dir") or Path(__file__).resolve().parents[3] / "data")
-        profile_template = load_profile(data_dir)
+        # 画像模式：仅当调用方显式注入 _data_dir（web 面板/CLI 正式运行）且画像存在时启用。
+        # 未注入 _data_dir 的调用（单测/脚本）保持 legacy 简历匹配，不受仓库真实 data/ 影响。
+        data_dir_value = config.get("_data_dir")
+        profile_template = load_profile(Path(data_dir_value)) if data_dir_value else None
         if profile_template is not None:
             config["_profile_template"] = profile_template
             # 画像否决 title 并入预筛排除词（AI 前粗筛，省 token）

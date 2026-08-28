@@ -431,6 +431,7 @@ def _execute_collect(task: WorkbenchTask, config: dict) -> None:
 		score_config["_workbench_stop_event"] = task.stop_requested
 		score_config["_workbench_log"] = lambda message: _log(task, message)
 		score_config["_workbench_score_progress"] = lambda state: _record_score_progress(task, state)
+		score_config["_data_dir"] = str(DATA_DIR)  # 画像模式：score_jobs 依此加载 profile_template.json
 		score_jobs(score_config)
 		return
 
@@ -485,6 +486,7 @@ def _execute_rescore(task: WorkbenchTask, config: dict) -> None:
 	score_config["_workbench_stop_event"] = task.stop_requested
 	score_config["_workbench_log"] = lambda message: _log(task, message)
 	score_config["_workbench_score_progress"] = lambda state: _record_score_progress(task, state)
+	score_config["_data_dir"] = str(DATA_DIR)  # 画像模式：score_jobs 依此加载 profile_template.json
 	_log(task, "开始重新评分")
 	score_jobs(score_config, rescore_filtered=True)
 
@@ -516,6 +518,7 @@ def _execute_score(task: WorkbenchTask, config: dict) -> None:
 	score_config["_workbench_log"] = lambda message: _log(task, message)
 	score_config["_workbench_score_progress"] = lambda state: _record_score_progress(task, state)
 	score_config["_workbench_score_checkpoint"] = checkpoint
+	score_config["_data_dir"] = str(DATA_DIR)  # 画像模式：score_jobs 依此加载 profile_template.json
 	_log(task, f"开始单独 AI 评分：{len(options.get('job_ids', []))} 个岗位")
 	try:
 		score_jobs(

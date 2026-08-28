@@ -30,9 +30,11 @@ RENDER_POLL_ATTEMPTS = 10
 
 # Only codes verified by the contributed implementation are bundled. Unknown
 # cities are rejected instead of guessing or reusing another platform's code.
+# 深圳 040000 于 2026-08-28 经采集浏览器实测核对（we.51job.com 搜索结果显示深圳岗位）。
 CITY_SNAPSHOT = (
     {"name": "北京", "code": "010000"},
     {"name": "上海", "code": "020000"},
+    {"name": "深圳", "code": "040000"},
 )
 
 
