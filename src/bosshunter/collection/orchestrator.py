@@ -365,13 +365,14 @@ class CollectionOrchestrator:
                 })
                 all_new_ids.extend(result.new_job_ids)
                 self._persist(states, all_new_ids, platform, stop_reason=result.reason_code, error=result.error)
-                # A verification, rate-limit, or unknown blocking page is an
-                # account-level signal. Stop the entire serial queue instead
-                # of immediately moving the same browser session to another
-                # recruitment platform.
+                # 登录墙/验证码/网络错误：当前平台账号级风控，跳过继续下一个平台
+                # （三平台各用独立账号，智联被拦不该连累 51job）
+                if result.status in {"blocked", "failed"}:
+                    self._notify_platform_blocked(platform, result)
+                    continue
+                # 浏览器断开 / 用户主动停止：整个队列停
                 if (
-                    result.status == "blocked"
-                    or result.reason_code in {"user_stopped", "browser_disconnected"}
+                    result.reason_code in {"user_stopped", "browser_disconnected"}
                     or (self.stop_event and self.stop_event.is_set())
                 ):
                     break
@@ -456,6 +457,29 @@ class CollectionOrchestrator:
                 "save_failed": sum(int(value.get("save_failed") or 0) for value in states.values()),
                 "progress": {"run_id": self.run_id, "outcome": "scoring", "current_platform": "", "platforms": deepcopy(states)},
             })
+
+    def _notify_platform_blocked(self, platform: str, result: PlatformCollectionResult) -> None:
+        """单个平台被登录墙/验证码/网络错误拦截时发飞书通知，提醒用户处理后手动重跑。"""
+        try:
+            from bosshunter.notify import send_notification
+            platform_label = {"boss": "BOSS直聘", "zhilian": "智联招聘", "51job": "前程无忧"}.get(platform, platform)
+            reason_map = {
+                "browser_locked": "登录墙/验证码",
+                "login_wall": "登录墙",
+                "captcha": "验证码",
+                "verification": "安全验证",
+                "daily_limit": "今日配额已用完",
+                "network_error": "网络错误",
+            }
+            reason_text = reason_map.get(result.reason_code, result.reason_code or result.status)
+            send_notification(
+                self.config,
+                f"{platform_label} 采集被拦截：{reason_text}\n{result.message or ''}\n请在采集 Edge 中处理后，手动单独采集该平台。",
+                title=f"{platform_label} 需处理",
+            )
+        except Exception:
+            # 通知失败不影响主流程跳过继续
+            pass
 
     def _persist(
         self,
