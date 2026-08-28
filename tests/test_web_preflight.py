@@ -157,11 +157,12 @@ class BrowserPreflightTests(unittest.TestCase):
 		self.assertIn("chrome://inspect/#remote-debugging", chrome_check["detail"])
 
 	@patch("bosshunter.web.preflight.run_browser_diagnostics")
-	def test_non_google_browser_is_reported(self, diagnostics):
+	def test_edge_browser_is_accepted(self, diagnostics):
 		diagnostics.return_value = {
 			"node": {"available": True, "version": "v22"},
 			"runtime": True,
 			"chrome": True,
+			"browser_name": "Microsoft Edge",
 			"browser_product": "Edg/138.0",
 			"boss_tab": None,
 			"errors": [],
@@ -170,9 +171,9 @@ class BrowserPreflightTests(unittest.TestCase):
 
 		checks = check_browser_connection({})
 
-		product_check = next(check for check in checks if check["id"] == "chrome_product")
-		self.assertEqual(product_check["status"], "error")
-		self.assertIn("不是 Google Chrome", product_check["message"])
+		chrome_check = next(check for check in checks if check["id"] == "chrome_connection")
+		self.assertEqual(chrome_check["status"], "pass")
+		self.assertIn("Microsoft Edge", chrome_check["message"])
 
 	@patch("bosshunter.web.preflight.run_browser_diagnostics")
 	def test_chromium_name_is_rejected_even_when_product_looks_like_chrome(self, diagnostics):

@@ -295,20 +295,23 @@ def check_browser_connection(config: dict, collection_options: dict | None = Non
 	elif result.get("chrome"):
 		product = str(result.get("browser_product") or "").strip()
 		browser_name = str(result.get("browser_name") or "").strip()
-		is_google_chrome = (
-			browser_name in {"Google Chrome", "Google Chrome Canary"}
+		# 改造版：方案A使用专用 Edge（BossHunterEdge profile + CDP 9222），
+		# Edge 与 Chrome 同为 Chromium 内核，CDP 协议完全兼容，一并放行。
+		supported_browsers = {"Google Chrome", "Google Chrome Canary", "Microsoft Edge"}
+		is_supported_browser = (
+			browser_name in supported_browsers
 			if browser_name
-			else not product or product.startswith("Chrome/")
+			else not product or product.startswith(("Chrome/", "Edg/"))
 		)
-		if not is_google_chrome:
+		if not is_supported_browser:
 			detected_browser = browser_name or product
 			checks.append(
 				_check(
 					"chrome_product",
 					"浏览器类型",
 					"error",
-					f"当前连接的不是 Google Chrome（{detected_browser}）",
-					"请关闭当前调试连接，改用 Google Chrome 开启远程调试后重新检测。",
+					f"当前连接的不是受支持的浏览器（{detected_browser}）",
+					"请改用 Google Chrome 或 Microsoft Edge 开启远程调试后重新检测。",
 					"browser",
 				)
 			)
@@ -318,9 +321,9 @@ def check_browser_connection(config: dict, collection_options: dict | None = Non
 			checks.append(
 				_check(
 					"chrome_connection",
-					"Chrome 远程调试",
+					"浏览器远程调试",
 					"pass",
-					f"Google Chrome 已连接{product_text}",
+					f"浏览器已连接{product_text}",
 					"远程调试连接正常。",
 				)
 			)

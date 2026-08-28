@@ -37,8 +37,6 @@ from bosshunter.db import (
 	get_funnel_stats,
 	get_jobs_needing_resume,
 	get_jobs_pending_confirmation,
-	get_jobs_ready_to_send,
-	get_jobs_with_send_errors,
 	get_recent_history,
 	get_unresolved_resume_failures,
 	get_stats,
@@ -180,6 +178,17 @@ def _redact_config_for_response(config):
 		auth_token = ai_cfg.pop("auth_token", None)
 		if auth_token:
 			ai_cfg["auth_token_masked"] = _mask_api_key(str(auth_token))
+	notify_cfg = redacted.get("notify")
+	if isinstance(notify_cfg, dict):
+		lark_app = notify_cfg.get("lark_app")
+		if isinstance(lark_app, dict):
+			secret = lark_app.pop("app_secret", None)
+			if secret:
+				lark_app["app_secret_masked"] = _mask_api_key(str(secret))
+			# open_id 不是密钥，但长度较短时打码部分显示，便于用户校验填的是自己的不是别人的
+			oid = lark_app.get("open_id")
+			if isinstance(oid, str) and oid:
+				lark_app["open_id"] = oid if len(oid) <= 8 else (oid[:4] + "***" + oid[-4:])
 	return redacted
 
 
@@ -190,6 +199,11 @@ def _config_download_payload(config: dict) -> str:
 	if isinstance(ai_cfg, dict):
 		ai_cfg.pop("api_key_masked", None)
 		ai_cfg.pop("auth_token_masked", None)
+	notify_cfg = redacted.get("notify")
+	if isinstance(notify_cfg, dict):
+		lark_app = notify_cfg.get("lark_app")
+		if isinstance(lark_app, dict):
+			lark_app.pop("app_secret_masked", None)
 	return yaml.dump(redacted, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
 
@@ -223,45 +237,94 @@ def _write_config(config: dict) -> None:
 def _sanitize_config_for_write(data):
 	"""Remove browser-only fields and preserve existing secrets on blank posts."""
 	cleaned = remove_retired_collection_settings(deepcopy(data))
+	existing_full = load_config(CONFIG_PATH)
 	ai_cfg = cleaned.get("ai")
-	if not isinstance(ai_cfg, dict):
-		return cleaned
+	if isinstance(ai_cfg, dict):
+		ai_cfg.pop("api_key_masked", None)
+		ai_cfg.pop("has_api_key", None)
+		ai_cfg.pop("auth_token_masked", None)
+		ai_cfg.pop("has_auth_token", None)
 
-	ai_cfg.pop("api_key_masked", None)
-	ai_cfg.pop("has_api_key", None)
-	ai_cfg.pop("auth_token_masked", None)
-	ai_cfg.pop("has_auth_token", None)
+		existing_ai = existing_full.get("ai", {})
+		service = ai_cfg.get("service") or existing_ai.get("service")
+		if service not in AI_SERVICE_PRESETS:
+			provider = ai_cfg.get("provider") or existing_ai.get("provider") or "anthropic"
+			service = "custom" if provider == "openai_compatible" else "anthropic"
+		ai_cfg["service"] = service
+		ai_cfg["provider"] = AI_SERVICE_PRESETS[service]["provider"]
 
-	existing_ai = load_config(CONFIG_PATH).get("ai", {})
-	service = ai_cfg.get("service") or existing_ai.get("service")
-	if service not in AI_SERVICE_PRESETS:
-		provider = ai_cfg.get("provider") or existing_ai.get("provider") or "anthropic"
-		service = "custom" if provider == "openai_compatible" else "anthropic"
-	ai_cfg["service"] = service
-	ai_cfg["provider"] = AI_SERVICE_PRESETS[service]["provider"]
+		clear_credentials = bool(ai_cfg.pop("clear_credentials", False))
 
-	clear_credentials = bool(ai_cfg.pop("clear_credentials", False))
-
-	for field in ("api_key", "auth_token"):
-		if clear_credentials:
+		for field in ("api_key", "auth_token"):
+			if clear_credentials:
+				posted_value = ai_cfg.get(field)
+				if posted_value is None or str(posted_value).strip() == "":
+					ai_cfg.pop(field, None)
+				continue
 			posted_value = ai_cfg.get(field)
-			if posted_value is None or str(posted_value).strip() == "":
-				ai_cfg.pop(field, None)
-			continue
-		posted_value = ai_cfg.get(field)
-		existing_value = existing_ai.get(field)
-		existing_mask = _mask_api_key(str(existing_value)) if existing_value else ""
-		should_preserve = (
-			posted_value is None
-			or str(posted_value).strip() == ""
-			or (existing_mask and posted_value == existing_mask)
-		)
+			existing_value = existing_ai.get(field)
+			existing_mask = _mask_api_key(str(existing_value)) if existing_value else ""
+			should_preserve = (
+				posted_value is None
+				or str(posted_value).strip() == ""
+				or (existing_mask and posted_value == existing_mask)
+			)
 
-		if should_preserve:
-			if existing_value:
-				ai_cfg[field] = existing_value
-			else:
-				ai_cfg.pop(field, None)
+			if should_preserve:
+				if existing_value:
+					ai_cfg[field] = existing_value
+				else:
+					ai_cfg.pop(field, None)
+
+	# notify.lark_app 凭证保护：和 AI key 同样规则，空白 / 等于打码时保留磁盘上的原值
+	notify_cfg = cleaned.get("notify")
+	if isinstance(notify_cfg, dict):
+		lark_app = notify_cfg.get("lark_app")
+		if lark_app is None:
+			pass
+		elif not isinstance(lark_app, dict):
+			# 非法结构直接丢掉，避免污染
+			notify_cfg.pop("lark_app", None)
+		else:
+			masked_secret = lark_app.pop("app_secret_masked", None)
+			posted_secret = lark_app.get("app_secret")
+			existing_lark = (existing_full.get("notify") or {}).get("lark_app") if isinstance(existing_full.get("notify"), dict) else None
+			existing_secret = None
+			if isinstance(existing_lark, dict):
+				existing_secret = existing_lark.get("app_secret")
+			existing_secret_mask = _mask_api_key(str(existing_secret)) if existing_secret else ""
+			# open_id 浏览器展示时被部分打码，不代表用户清空，所以也要走保留逻辑
+			posted_oid = lark_app.get("open_id")
+			existing_oid = existing_lark.get("open_id") if isinstance(existing_lark, dict) else None
+
+			should_preserve_secret = (
+				posted_secret is None
+				or str(posted_secret).strip() == ""
+				or (existing_secret_mask and str(posted_secret) == existing_secret_mask)
+				or (masked_secret is not None and existing_secret_mask and str(masked_secret) == existing_secret_mask)
+			)
+			if should_preserve_secret:
+				if existing_secret:
+					lark_app["app_secret"] = existing_secret
+				else:
+					lark_app.pop("app_secret", None)
+			# open_id：浏览器贴了被截断展示的 ou_xxx***xxx 时，还原磁盘上的原值
+			if isinstance(existing_oid, str) and existing_oid and isinstance(posted_oid, str):
+				# 两种情况视为没改：浏览器返回的截断显示，或两端实质相同（去掉前后空白）
+				trimmed_existing = existing_oid.strip()
+				trimmed_posted = posted_oid.strip()
+				if (
+					trimmed_posted == trimmed_existing
+					or (len(trimmed_existing) > 8 and trimmed_posted == (trimmed_existing[:4] + "***" + trimmed_existing[-4:]))
+					or trimmed_posted == ""
+				):
+					lark_app["open_id"] = trimmed_existing
+
+			# app_id 不涉及打码但兜底：用户留空就沿用已有
+			posted_appid = str(lark_app.get("app_id") or "").strip()
+			existing_appid = existing_lark.get("app_id") if isinstance(existing_lark, dict) else None
+			if not posted_appid and isinstance(existing_appid, str) and existing_appid.strip():
+				lark_app["app_id"] = existing_appid.strip()
 
 	return cleaned
 
@@ -467,44 +530,6 @@ def _execute_score(task: WorkbenchTask, config: dict) -> None:
 		raise
 
 
-def _queue_monitor_delivery(
-	task: WorkbenchTask,
-	job_ids: list[str],
-	*,
-	direct_send: bool = False,
-) -> dict:
-	"""Queue confirmed jobs on a task that is already in its monitor loop."""
-	queue_lock = task.context.get("monitor_queue_lock")
-	if queue_lock is None:
-		queue_lock = Lock()
-		task.context["monitor_queue_lock"] = queue_lock
-	with queue_lock:
-		pending = task.context.setdefault("pending_deliveries", [])
-		queued_ids = {
-			str(job_id)
-			for batch in pending
-			for job_id in batch.get("job_ids", [])
-		}
-		new_ids = [job_id for job_id in job_ids if job_id not in queued_ids]
-		if new_ids:
-			pending.append({"job_ids": new_ids, "direct_send": direct_send})
-			_log(task, f"监测期间新增 {len(new_ids)} 个确认投递岗位，已加入发送队列")
-	wakeup_event = task.context.get("monitor_wakeup_event")
-	if isinstance(wakeup_event, Event):
-		wakeup_event.set()
-	return task.snapshot()
-
-
-def _take_monitor_deliveries(task: WorkbenchTask) -> list[dict]:
-	queue_lock = task.context.get("monitor_queue_lock")
-	if queue_lock is None:
-		return []
-	with queue_lock:
-		pending = list(task.context.get("pending_deliveries", []))
-		task.context["pending_deliveries"] = []
-	return pending
-
-
 def _execute_monitor(task: WorkbenchTask, config: dict, *, initial_cooldown: bool = False) -> None:
 	from bosshunter.executor.monitor import (
 		get_effective_monitor_interval_minutes,
@@ -517,22 +542,12 @@ def _execute_monitor(task: WorkbenchTask, config: dict, *, initial_cooldown: boo
 	monitor_config["_workbench_stop_event"] = task.stop_requested
 	interval_min = get_effective_monitor_interval_minutes(config)
 	interval_sec = max(interval_min * 60, 1)
-	queue_lock = task.context.setdefault("monitor_queue_lock", Lock())
 	wakeup_event = task.context.setdefault("monitor_wakeup_event", Event())
 	task.context["monitoring"] = True
 	try:
 		if initial_cooldown and wait_for_initial_monitor_cooldown(task, config, _log):
 			return
 		while not task.stop_requested.is_set():
-			for batch in _take_monitor_deliveries(task):
-				deliver_config = dict(config)
-				deliver_config["_workbench_job_ids"] = batch.get("job_ids", [])
-				if batch.get("direct_send"):
-					deliver_config["_workbench_skip_greeting"] = True
-				_log(task, f"处理监测期间新增的 {len(deliver_config['_workbench_job_ids'])} 个投递岗位")
-				_execute_deliver(task, deliver_config)
-				if task.stop_requested.is_set():
-					return
 			_log(task, "执行一轮监测")
 			summary = monitor_and_send_resumes(monitor_config)
 			if task.stop_requested.is_set():
@@ -558,24 +573,12 @@ def _execute_monitor(task: WorkbenchTask, config: dict, *, initial_cooldown: boo
 	finally:
 		task.context["monitoring"] = False
 		task.context.pop("monitor_wakeup_event", None)
-		task.context.pop("monitor_queue_lock", None)
 
 
 def _execute_full(task: WorkbenchTask, config: dict) -> None:
-	db = _get_web_db()
-	try:
-		deferred_job_ids = [str(job["id"]) for job in get_jobs_ready_to_send(db)]
-	finally:
-		db.close()
-	if deferred_job_ids:
-		_log(task, f"优先续发上次已确认但未完成的 {len(deferred_job_ids)} 个岗位")
-		deferred_config = load_config(CONFIG_PATH)
-		deferred_config["_workbench_job_ids"] = deferred_job_ids
-		deferred_config["_workbench_skip_greeting"] = True
-		_execute_deliver(task, deferred_config)
-		if task.stop_requested.is_set():
-			return
-
+	# 改造版：全流程 = 采集 + AI 评分即止。
+	# 投递由魔王大人在平台页面上手动完成（岗位池里「打开平台 / 我已发送」），
+	# 这里不再等待前端确认、不自动发送招呼语、不自动进入监测。
 	full_collection_config = dict(config)
 	try:
 		configured_options = full_collection_config.get("_collection_options")
@@ -594,128 +597,7 @@ def _execute_full(task: WorkbenchTask, config: dict) -> None:
 	_execute_collect(task, full_collection_config)
 	if task.stop_requested.is_set():
 		return
-
-	db = _get_web_db()
-	try:
-		threshold = int(config.get("scoring", {}).get("threshold", 60) or 60)
-		pending_confirmation = [
-			job for job in get_jobs_pending_confirmation(db)
-			if int(job.get("score") or 0) >= threshold
-		]
-	finally:
-		db.close()
-	if not pending_confirmation:
-		task.context["waiting_confirmation"] = False
-		task.context["confirmation_complete"] = True
-		_log(task, "没有待确认岗位，流程结束")
-		return
-
-	confirmation_event = Event()
-	task.context["confirmation_event"] = confirmation_event
-	task.context["waiting_confirmation"] = True
-	if task.context.get("delivery_requested"):
-		confirmation_event.set()
-	_log(task, "等待前端确认投递")
-	while not task.stop_requested.is_set() and not confirmation_event.wait(0.5):
-		pass
-	if task.stop_requested.is_set():
-		return
-
-	job_ids = [str(job_id) for job_id in task.context.get("confirmed_job_ids", []) if str(job_id)]
-	task.context["waiting_confirmation"] = False
-	task.context["confirmation_complete"] = True
-	task.context["delivery_requested"] = False
-	if not job_ids:
-		_log(task, "未收到前端确认岗位，流程结束")
-		return
-
-	_log(task, f"前端已确认 {len(job_ids)} 个岗位，继续投递")
-	if _wait_for_collection_delivery_cooldown(task, config):
-		return
-	# The user may adjust the daily limit or other send settings while reviewing
-	# jobs. Reload immediately before delivery instead of using the task-start snapshot.
-	deliver_config = load_config(CONFIG_PATH)
-	deliver_config["_workbench_job_ids"] = job_ids
-	_execute_deliver(task, deliver_config)
-	if task.stop_requested.is_set():
-		return
-	_execute_monitor(task, load_config(CONFIG_PATH), initial_cooldown=True)
-
-
-def _queue_active_delivery(
-	task: WorkbenchTask,
-	job_ids: list[str],
-	*,
-	direct_send: bool,
-) -> tuple[dict, list[str]]:
-	"""Append jobs to the currently running single delivery worker."""
-	queue_lock = task.context.setdefault("delivery_queue_lock", Lock())
-	with queue_lock:
-		if not task.context.get("delivering"):
-			raise TaskAlreadyRunningError("当前发送任务即将结束，请稍后重试")
-		scheduled_ids = task.context.setdefault("delivery_scheduled_ids", set())
-		new_ids = [job_id for job_id in job_ids if job_id not in scheduled_ids]
-		already_queued_count = len(job_ids) - len(new_ids)
-		if new_ids:
-			task.context.setdefault("pending_deliveries", []).append({
-				"job_ids": new_ids,
-				"direct_send": direct_send,
-			})
-			scheduled_ids.update(new_ids)
-			_log(task, f"新增 {len(new_ids)} 个岗位，已加入当前发送队列")
-		elif already_queued_count:
-			_log(task, f"所选 {already_queued_count} 个岗位已在当前发送队列中")
-	payload = task.snapshot()
-	payload["queued_count"] = len(new_ids)
-	payload["already_queued_count"] = already_queued_count
-	return payload, new_ids
-
-
-def _take_active_delivery(task: WorkbenchTask) -> dict | None:
-	queue_lock = task.context.get("delivery_queue_lock")
-	if queue_lock is None:
-		return None
-	with queue_lock:
-		pending = task.context.setdefault("pending_deliveries", [])
-		if pending:
-			return pending.pop(0)
-		task.context["delivering"] = False
-		return None
-
-
-def _execute_deliver(task: WorkbenchTask, config: dict) -> None:
-	"""Run one delivery worker and drain batches queued while it is active."""
-	if _stop_for_active_platform_lock(task):
-		return
-	queue_lock = task.context.setdefault("delivery_queue_lock", Lock())
-	with queue_lock:
-		task.context["delivering"] = True
-		task.context.setdefault("pending_deliveries", [])
-		task.context.setdefault("delivery_scheduled_ids", set()).update(
-			str(job_id) for job_id in config.get("_workbench_job_ids", []) if str(job_id)
-		)
-
-	current_config = config
-	try:
-		while not task.stop_requested.is_set():
-			_execute_deliver_batch(task, current_config)
-			if task.stop_requested.is_set():
-				return
-			batch = _take_active_delivery(task)
-			if not batch:
-				return
-			current_config = dict(config)
-			current_config["_workbench_job_ids"] = batch.get("job_ids", [])
-			if batch.get("direct_send"):
-				current_config["_workbench_skip_greeting"] = True
-			else:
-				current_config.pop("_workbench_skip_greeting", None)
-			_log(task, f"继续处理队列中的 {len(current_config['_workbench_job_ids'])} 个岗位")
-	finally:
-		with queue_lock:
-			task.context["delivering"] = False
-			task.context.pop("delivery_scheduled_ids", None)
-			task.context.pop("pending_deliveries", None)
+	_log(task, "全流程结束：采集与评分已完成；投递请在岗位池中手动跳转平台完成")
 
 
 def _stop_for_active_platform_lock(task: WorkbenchTask) -> bool:
@@ -733,118 +615,12 @@ def _stop_for_active_platform_lock(task: WorkbenchTask) -> bool:
 	return True
 
 
-def _wait_for_collection_delivery_cooldown(task: WorkbenchTask, config: dict) -> bool:
-	completed_at = task.context.get("boss_collection_completed_monotonic")
-	if not isinstance(completed_at, (int, float)):
-		return False
-	collection_config = config.get("collection", {})
-	selected_minutes = task.context.get("boss_delivery_cooldown_minutes")
-	if not isinstance(selected_minutes, (int, float)):
-		if (
-			"delivery_cooldown_min_minutes" in collection_config
-			or "delivery_cooldown_max_minutes" in collection_config
-		):
-			try:
-				minimum = max(float(collection_config.get("delivery_cooldown_min_minutes", 5)), 0)
-			except (TypeError, ValueError):
-				minimum = 5
-			try:
-				maximum = max(float(collection_config.get("delivery_cooldown_max_minutes", 15)), 0)
-			except (TypeError, ValueError):
-				maximum = 15
-			minimum, maximum = sorted((minimum, maximum))
-			selected_minutes = random.uniform(minimum, maximum)
-		else:
-			# Compatibility with configurations saved before random cooldown ranges.
-			try:
-				selected_minutes = max(float(collection_config.get("delivery_cooldown_minutes", 10)), 0)
-			except (TypeError, ValueError):
-				selected_minutes = 10
-		task.context["boss_delivery_cooldown_minutes"] = selected_minutes
-	cooldown_seconds = float(selected_minutes) * 60
-	remaining = max(cooldown_seconds - (time.monotonic() - completed_at), 0)
-	if remaining <= 0:
-		return False
-	_log(task, f"为了账户安全，BOSS 采集结束后冷却 {remaining / 60:.1f} 分钟再开始 BOSS 投递")
-	if task.stop_requested.wait(remaining):
-		_log(task, "采集到投递的安全冷却已取消")
-		return True
-	return False
-
-
-def _execute_deliver_batch(task: WorkbenchTask, config: dict) -> None:
-	from bosshunter.ai.greeter import generate_greetings
-	from bosshunter.executor.sender import send_greetings
-
-	config = dict(config)
-	config["_workbench_stop_event"] = task.stop_requested
-	config["_workbench_log"] = lambda message: _log(task, message)
-	selected_job_ids = [str(job_id) for job_id in config.get("_workbench_job_ids", []) if str(job_id)]
-	if not config.get("_workbench_skip_greeting"):
-		_log(task, "生成招呼语")
-		generated_count = generate_greetings(config)
-		_log(task, f"招呼语生成完成：{generated_count}/{len(selected_job_ids) or generated_count}")
-		if task.stop_requested.is_set():
-			return
-		if selected_job_ids and generated_count != len(selected_job_ids):
-			raise RuntimeError(
-				f"招呼语生成失败：选择 {len(selected_job_ids)} 个岗位，仅成功生成 {generated_count} 条；未发送任何消息"
-			)
-	_log(task, "发送招呼语")
-	# The workbench must obey the same send window and day-off guard as the CLI.
-	# ``force`` remains an explicit CLI-only override and is never implied by a
-	# browser button click.
-	sent_count = send_greetings(config, force=False)
-	report = config.get("_workbench_send_report", {})
-	failed_count = int(report.get("failed_count", 0) or 0)
-	deferred_count = int(report.get("deferred_count", 0) or 0)
-	quota_deferred_count = min(
-		int(report.get("quota_deferred_count", 0) or 0),
-		deferred_count,
-	)
-	paused_count = max(deferred_count - quota_deferred_count, 0)
-	task.metrics.update({
-		"send_requested": int(report.get("requested_count", len(selected_job_ids)) or 0),
-		"send_success": int(report.get("sent_count", sent_count) or 0),
-		"send_failed": failed_count,
-		"send_deferred": deferred_count,
-		"send_quota_deferred": quota_deferred_count,
-		"send_already_today": int(report.get("already_sent", 0) or 0),
-		"send_daily_limit": int(report.get("daily_limit", 0) or 0),
-		"send_remaining_quota": int(report.get("remaining_quota", 0) or 0),
-	})
-	total_count = len(selected_job_ids) or sent_count + failed_count + deferred_count
-	_log(
-		task,
-		f"招呼语发送结果：成功 {sent_count}，失败 {failed_count}，待下次发送 {deferred_count}（共 {total_count}）",
-	)
-	if failed_count:
-		_log(task, f"{failed_count} 个岗位发送失败已单独记录，继续后续流程")
-	if quota_deferred_count:
-		_log(task, f"{quota_deferred_count} 个岗位因今日发送额度未执行，已保留在“待发送招呼语”")
-	if paused_count:
-		_log(task, f"{paused_count} 个岗位本轮未执行，已保留在“待发送招呼语”")
-
-	stop_reason = report.get("stop_reason")
-	if stop_reason:
-		task.stop_reason = str(stop_reason)
-	if stop_reason in {"captcha", "rate_limit", "blocked", "consecutive_errors"}:
-		reason_labels = {
-			"captcha": "验证码",
-			"rate_limit": "频率限制",
-			"blocked": "账号或请求被拦截",
-			"consecutive_errors": "连续错误过多",
-		}
-		raise RuntimeError(f"发送已安全暂停：检测到{reason_labels[stop_reason]}")
-
-
 task_runner._executors.update({
 	"full": _execute_full,
 	"collect": _execute_collect,
 	"rescore": _execute_rescore,
 	"score": _execute_score,
 	"monitor": _execute_monitor,
-	"deliver": _execute_deliver,
 })
 
 
@@ -1088,11 +864,6 @@ def api_workbench():
 	try:
 		config = load_config(CONFIG_PATH)
 		threshold = config.get("scoring", {}).get("threshold", 60)
-		daily_limit = int(config.get("throttle", {}).get("daily_limit", 30) or 30)
-		today_sent_row = db.execute(
-			"SELECT COUNT(*) AS cnt FROM history WHERE action='sent' AND date(created_at)=date('now')"
-		).fetchone()
-		today_sent = int(today_sent_row["cnt"] if today_sent_row else 0)
 		status = task_runner.status()
 		return _json_response({
 			"funnel": get_funnel_stats(db),
@@ -1102,24 +873,10 @@ def api_workbench():
 				if int(job.get("score") or 0) >= threshold
 				and platform_supports(str(job.get("source_platform") or "boss"), "deliver")
 			],
-			"pending_greetings": [
-				job for job in get_jobs_ready_to_send(db)
-				if platform_supports(str(job.get("source_platform") or "boss"), "deliver")
-			],
-			"send_errors": [
-				job for job in get_jobs_with_send_errors(db)
-				if platform_supports(str(job.get("source_platform") or "boss"), "deliver")
-			],
 			"needs_resume": [
 				job for job in get_jobs_needing_resume(db)
 				if platform_supports(str(job.get("source_platform") or "boss"), "deliver")
 			],
-			"send_quota": {
-				"daily_limit": daily_limit,
-				"sent": today_sent,
-				"remaining": max(daily_limit - today_sent, 0),
-				"exhausted": today_sent >= daily_limit,
-			},
 			"task": status["active"],
 			"last_task": status["last_task"],
 		})
@@ -1334,15 +1091,7 @@ def api_workbench_task_start():
 				collection_options = normalize_collection_options(base_config, options)
 			except ValueError as exc:
 				return _json_response({"error": str(exc)}, 400)
-			collection_only = [
-				platform for platform in collection_options["platform_order"]
-				if not platform_supports(platform, "deliver")
-			]
-			if collection_only:
-				return _json_response({
-					"error": "智联和前程无忧当前只支持单独采集，不能进入发送全流程",
-					"collection_only_platforms": collection_only,
-				}, 400)
+			# 改造版：全流程 = 采集 + 评分，不含投递，所有平台均可运行
 			collection_options["auto_score"] = True
 		messages = _preflight_messages(mode, base_config, collection_options)
 		if messages:
@@ -1401,171 +1150,6 @@ def api_workbench_task_stop(task_id):
 		return _json_response(task_runner.stop(task_id))
 	except KeyError:
 		return _json_response({"error": "任务不存在"}, 404)
-	except Exception as e:
-		return _json_response({"error": str(e)}, 500)
-
-
-@app.route("/api/workbench/deliver", method="POST")
-def api_workbench_deliver():
-	try:
-		body = request.json or {}
-		job_ids = [str(job_id) for job_id in body.get("job_ids", []) if str(job_id)]
-		if not job_ids:
-			return _json_response({"error": "请选择要投递的岗位"}, 400)
-		direct_send = bool(body.get("direct_send"))
-		validation_db = _get_web_db()
-		try:
-			placeholders = ",".join("?" for _ in job_ids)
-			active_ids = {
-				str(row["id"])
-				for row in validation_db.execute(
-					f"SELECT id FROM jobs WHERE deleted_at IS NULL AND id IN ({placeholders})",
-					job_ids,
-				).fetchall()
-			}
-			platform_rows = validation_db.execute(
-				f"SELECT id, status, greeting, COALESCE(source_platform, 'boss') AS source_platform FROM jobs WHERE deleted_at IS NULL AND id IN ({placeholders})",
-				job_ids,
-			).fetchall()
-		finally:
-			validation_db.close()
-		invalid_ids = [job_id for job_id in job_ids if job_id not in active_ids]
-		if invalid_ids:
-			return _json_response({"error": "所选岗位不存在或已进入回收站", "invalid_ids": invalid_ids}, 409)
-		unsupported = [
-			str(row["id"])
-			for row in platform_rows
-			if not platform_supports(str(row["source_platform"] or "boss"), "deliver")
-		]
-		if unsupported:
-			return _json_response({
-				"error": "所选岗位的平台暂不支持投递动作",
-				"unsupported_platform": "unknown",
-				"invalid_ids": unsupported,
-			}, 403)
-		allowed_statuses = {"ready", "approved", "error"} if direct_send else {"ready", "approved"}
-		invalid_status_ids = [
-			str(row["id"])
-			for row in platform_rows
-			if str(row["status"] or "") not in allowed_statuses
-			or (direct_send and not str(row["greeting"] or "").strip())
-		]
-		if invalid_status_ids:
-			return _json_response({
-				"error": "所选岗位状态不允许投递，不能重复发送已投递岗位",
-				"invalid_ids": invalid_status_ids,
-			}, 409)
-
-		status = task_runner.status()
-		active_task = status.get("active") or {}
-		active_runtime_task = task_runner._tasks.get(active_task.get("id"))
-		monitoring_task = None
-		if (
-			active_runtime_task
-			and active_runtime_task.status == "running"
-			and active_runtime_task.context.get("monitoring")
-		):
-			monitoring_task = active_runtime_task
-		delivery_task = None
-		if (
-			active_runtime_task
-			and active_runtime_task.status == "running"
-			and active_runtime_task.context.get("delivering")
-		):
-			delivery_task = active_runtime_task
-		waiting_task = None
-		if (
-			not direct_send
-			and active_runtime_task
-			and active_runtime_task.mode == "full"
-			and active_runtime_task.status == "running"
-			and not monitoring_task
-			and not delivery_task
-			and not active_runtime_task.context.get("confirmation_complete")
-		):
-			waiting_task = active_runtime_task
-		if active_task and not waiting_task and not monitoring_task and not delivery_task:
-			raise TaskAlreadyRunningError(
-				f"当前已有后台任务「{active_task.get('label', '未知任务')}」正在运行或停止中，请等待其完全结束"
-			)
-
-		queued_payload = None
-		status_job_ids = job_ids
-		if delivery_task:
-			queued_payload, status_job_ids = _queue_active_delivery(
-				delivery_task,
-				job_ids,
-				direct_send=direct_send,
-			)
-
-		db = _get_web_db()
-		try:
-			for job_id in status_job_ids:
-				update_job_status(db, job_id, "approved")
-				if not direct_send:
-					add_history(db, job_id, "approved", "Web Dashboard 确认投递")
-		finally:
-			db.close()
-
-		if queued_payload is not None:
-			return _json_response(queued_payload)
-
-		if waiting_task:
-			waiting_task.context["confirmed_job_ids"] = job_ids
-			waiting_task.context["delivery_requested"] = True
-			confirmation_event = waiting_task.context.get("confirmation_event")
-			if isinstance(confirmation_event, Event):
-				confirmation_event.set()
-			return _json_response(waiting_task.snapshot())
-
-		if monitoring_task:
-			return _json_response(
-				_queue_monitor_delivery(
-					monitoring_task,
-					job_ids,
-					direct_send=direct_send,
-				)
-			)
-
-		deliver_options = {"_workbench_job_ids": job_ids}
-		if direct_send:
-			deliver_options["_workbench_skip_greeting"] = True
-		task = task_runner.start("deliver", _task_config(deliver_options))
-		return _json_response(task)
-	except TaskAlreadyRunningError as e:
-		return _json_response({"error": str(e)}, 409)
-	except Exception as e:
-		return _json_response({"error": str(e)}, 500)
-
-
-@app.route("/api/workbench/reject", method="POST")
-def api_workbench_reject():
-	try:
-		body = request.json or {}
-		job_ids = [str(job_id) for job_id in body.get("job_ids", []) if str(job_id)]
-		if not job_ids:
-			return _json_response({"error": "请选择要放弃的岗位"}, 400)
-
-		db = _get_web_db()
-		try:
-			placeholders = ",".join("?" for _ in job_ids)
-			active_ids = {
-				str(row["id"])
-				for row in db.execute(
-					f"SELECT id FROM jobs WHERE deleted_at IS NULL AND id IN ({placeholders})",
-					job_ids,
-				).fetchall()
-			}
-			invalid_ids = [job_id for job_id in job_ids if job_id not in active_ids]
-			if invalid_ids:
-				return _json_response({"error": "所选岗位不存在或已进入回收站", "invalid_ids": invalid_ids}, 409)
-			for job_id in job_ids:
-				update_job_status(db, job_id, "rejected")
-				add_history(db, job_id, "rejected", "Web Dashboard 放弃投递")
-		finally:
-			db.close()
-
-		return _json_response({"success": True, "count": len(job_ids)})
 	except Exception as e:
 		return _json_response({"error": str(e)}, 500)
 
@@ -2049,6 +1633,59 @@ def api_resume_delete():
 		_write_config(config)
 
 		return _json_response({"success": True})
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
+# ─── Notify APIs ─────────────────────────────────────────
+
+@app.route("/api/notify/test", method="POST")
+def api_notify_test():
+	"""用当前已保存的 notify 配置发一条测试消息。
+
+	说明：必须先“保存配置”后再测试，避免用户以为填了就能发但配置还没落盘，
+	也保证后端后续 monitor 跑时的行为与本次测试完全一致。
+	"""
+	try:
+		# 这里不读 request.body 中的未保存配置，直接取落盘后的 config.yaml
+		config = load_config(CONFIG_PATH)
+		from bosshunter.notify import is_notify_enabled, send_notification
+		if not is_notify_enabled(config):
+			notify_cfg = (config.get("notify") or {}) if isinstance(config.get("notify"), dict) else {}
+			lark_app = notify_cfg.get("lark_app") if isinstance(notify_cfg.get("lark_app"), dict) else {}
+			webhook = str(notify_cfg.get("feishu_webhook_url") or "").strip()
+			missing: list[str] = []
+			if not lark_app or not str(lark_app.get("app_id") or "").strip():
+				missing.append("App ID")
+			if not lark_app or not str(lark_app.get("app_secret") or "").strip():
+				missing.append("App Secret")
+			if not lark_app or not str(lark_app.get("open_id") or "").strip():
+				missing.append("接收人 Open ID")
+			if not webhook:
+				pass
+			if missing:
+				return _json_response({
+					"success": False,
+					"error": f"飞书通知未启用：缺少 {', '.join(missing)}。请先在上面填写完整并点击保存。",
+				}, 400)
+			return _json_response({
+				"success": False,
+				"error": "飞书通知未启用：enable 为 false，或所有出口配置均为空。",
+			}, 400)
+
+		ok = send_notification(
+			config,
+			"这是一条来自「智能求职工作台」的测试消息，用于验证飞书通知配置。\n"
+			"如果你收到了这条消息，说明「别人找我」的实时推送链路已经打通。\n"
+			"（电脑端浏览器窗口开着 BossHunter 工作台就能查详情）",
+			title="智能求职 · 测试消息",
+		)
+		if ok:
+			return _json_response({"success": True, "message": "测试消息已发送，请在飞书 App 查看（私信或群内通知，取决于你的配置）。"})
+		return _json_response({
+			"success": False,
+			"error": "发送失败，请在控制台查看详细错误（常见原因：App ID/Secret 错误、Open ID 不属于该应用、应用未获取 im:message 发送权限、网络不通）。",
+		}, 502)
 	except Exception as e:
 		return _json_response({"error": str(e)}, 500)
 

@@ -121,6 +121,12 @@ monitor:
   max_resume_sends_per_cycle: 5
   auto_reply_hr_questions: false
 
+notify:
+  # 飞书群机器人 webhook：监听到 HR 新回复 / 陌生 HR 主动联系时推送到手机
+  # 建群 → 群设置 → 群机器人 → 添加“自定义机器人” → 复制 webhook 地址填到这里
+  feishu_webhook_url: ""
+  enable: true
+
 follow_up:
   enabled: false
   interval_hours: 30

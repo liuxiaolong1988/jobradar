@@ -1143,6 +1143,7 @@ def _check_boss_replies(config: dict, tracked_jobs: list[dict] | None = None) ->
     except (TypeError, ValueError):
         max_conversations = 5
     results = []
+    cold_contacts = []  # 陌生HR主动联系（未匹配到已投岗位），推飞书提醒
     for conv in conversations:
         if stop_requested(config):
             break
@@ -1179,11 +1180,29 @@ def _check_boss_replies(config: dict, tracked_jobs: list[dict] | None = None) ->
             if len(results) >= max_conversations:
                 console.print(f"[dim]本轮已达到对话处理上限 {max_conversations}[/dim]")
                 break
+        else:
+            # 陌生HR主动联系：不进处理队列，但记下来推飞书（"别人找我"场景）
+            cold_contacts.append(conv)
+            console.print(
+                f"[cyan]  ~ 陌生HR主动联系: {conv.get('hr_name', '?')}（{conv.get('company', '未知公司')}）[/cyan]"
+            )
 
     if not results:
         console.print("[dim]暂无新回复[/dim]")
 
     db.close()
+
+    # 飞书推送：新回复 + 陌生HR主动联系（推送失败不影响主流程）
+    if results or cold_contacts:
+        try:
+            from bosshunter.notify import format_reply_notification, push_feishu_text
+
+            message = format_reply_notification(results, cold_contacts)
+            if message:
+                push_feishu_text(config, message)
+        except Exception as exc:  # noqa: BLE001 - 通知异常不能影响监测主流程
+            console.print(f"[yellow]飞书通知组装失败（不影响主流程）: {exc}[/yellow]")
+
     return results
 
 

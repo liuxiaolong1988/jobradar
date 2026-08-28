@@ -17,12 +17,11 @@ MODE_LABELS = {
     "score": "单独 AI 评分",
     "rescore": "重新评分",
     "monitor": "单独监测",
-    "deliver": "确认投递",
 }
 
 TERMINAL_STATUSES = {"completed", "failed", "stopped"}
 ACTIVE_STATUSES = {"running", "stopping"}
-DEADLINE_MODES = {"full", "monitor", "deliver"}
+DEADLINE_MODES = {"full", "monitor"}
 
 
 class TaskAlreadyRunningError(RuntimeError):

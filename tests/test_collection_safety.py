@@ -1,6 +1,5 @@
 import json
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -15,7 +14,7 @@ from bosshunter.db import (
 )
 from bosshunter.platform_safety import PlatformAccessGuard, PlatformSafetyStop
 from bosshunter.scraper.jobs import scrape_jobs
-from bosshunter.web.server import _execute_collect, _wait_for_collection_delivery_cooldown
+from bosshunter.web.server import _execute_collect
 from bosshunter.web.tasks import WorkbenchTask
 
 class CollectionSafetyTests(unittest.TestCase):
@@ -219,40 +218,6 @@ platforms:
             _execute_collect(task, config)
 
         self.assertTrue(any("为了账户安全" in line and "单日搜索页上限" in line for line in task.logs))
-
-    def test_collection_delivery_cooldown_is_cancellable(self):
-        task = WorkbenchTask(id="full", mode="full", label="运行全流程")
-        task.context["boss_collection_completed_monotonic"] = time.monotonic()
-        task.stop_requested.set()
-        self.assertTrue(
-            _wait_for_collection_delivery_cooldown(
-                task,
-                {
-                    "collection": {
-                        "delivery_cooldown_min_minutes": 5,
-                        "delivery_cooldown_max_minutes": 15,
-                    }
-                },
-            )
-        )
-
-    def test_collection_delivery_cooldown_selects_one_random_value_per_flow(self):
-        task = WorkbenchTask(id="full", mode="full", label="运行全流程")
-        task.context["boss_collection_completed_monotonic"] = time.monotonic()
-        task.stop_requested.set()
-        config = {
-            "collection": {
-                "delivery_cooldown_min_minutes": 5,
-                "delivery_cooldown_max_minutes": 15,
-            }
-        }
-
-        with patch("bosshunter.web.server.random.uniform", return_value=11.25) as choose:
-            self.assertTrue(_wait_for_collection_delivery_cooldown(task, config))
-            self.assertTrue(_wait_for_collection_delivery_cooldown(task, config))
-
-        choose.assert_called_once_with(5, 15)
-        self.assertEqual(task.context["boss_delivery_cooldown_minutes"], 11.25)
 
 
 if __name__ == "__main__":

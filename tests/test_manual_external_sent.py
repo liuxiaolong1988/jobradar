@@ -47,26 +47,30 @@ def test_external_manual_sent_is_atomic_and_idempotent():
     ]
 
 
-def test_manual_sent_rejects_boss_and_does_not_partially_update_external_jobs():
+def test_manual_sent_accepts_boss_and_updates_all_platform_jobs():
+    # 改造版：BOSS 也走人工投递，手动标记对全平台开放（原断言 boss 被拒绝已过时）
     with tempfile.TemporaryDirectory() as temporary:
         db = get_db(Path(temporary) / "jobs.db")
         try:
             insert_job(db, _job("external", "51job"))
             insert_job(db, _job("boss", "boss"))
-            with pytest.raises(JobManualSentConflictError) as captured:
-                mark_external_jobs_sent(db, ["external", "boss"], confirmed=True)
+            result = mark_external_jobs_sent(db, ["external", "boss"], confirmed=True)
             statuses = {
                 row["id"]: row["status"]
                 for row in db.execute("SELECT id, status FROM jobs WHERE id IN ('external', 'boss')").fetchall()
             }
+            history = db.execute(
+                "SELECT job_id, action FROM history ORDER BY job_id"
+            ).fetchall()
         finally:
             db.close()
 
-    assert captured.value.blocked == [{
-        "job_id": "boss",
-        "reasons": ["仅智联招聘和前程无忧支持手动标记已发送"],
-    }]
-    assert statuses == {"boss": "pending", "external": "pending"}
+    assert result["affected_count"] == 2
+    assert statuses == {"boss": "sent", "external": "sent"}
+    assert {(row["job_id"], row["action"]) for row in history} == {
+        ("boss", "manual_sent"),
+        ("external", "manual_sent"),
+    }
 
 
 def test_manual_sent_requires_explicit_confirmation():

@@ -38,7 +38,7 @@ class PlatformDeliveryGuardTests(TestCase):
             chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
             for chunk in server.app(environ, start_response)
         ).decode("utf-8")
-        return result["status"], json.loads(payload)
+        return result["status"], payload
 
     def test_collection_only_platforms_reject_delivery_and_resume_routes(self):
         for platform, job_id, url in (
@@ -63,12 +63,14 @@ class PlatformDeliveryGuardTests(TestCase):
                 server.set_base_dir(base_dir)
 
                 with mock.patch.object(server.task_runner, "start") as start:
-                    deliver_status, deliver_payload = self._request(
+                    deliver_status, deliver_body = self._request(
                         "/api/workbench/deliver",
                         {"job_ids": [job_id]},
                     )
-                resume_status, resume_payload = self._request(f"/api/jobs/{job_id}/mark-resume-sent")
+                resume_status, resume_body = self._request(f"/api/jobs/{job_id}/mark-resume-sent")
 
-                self.assertTrue(deliver_status.startswith("403"), deliver_payload)
-                self.assertTrue(resume_status.startswith("403"), resume_payload)
+                # 改造版：自动投递已整体下线，deliver 路由不复存在（405）；
+                # mark-resume-sent 仍拒绝不支持投递链路的纯采集平台（403）。
+                self.assertTrue(deliver_status.startswith("405"), deliver_body)
+                self.assertTrue(resume_status.startswith("403"), resume_body)
                 start.assert_not_called()

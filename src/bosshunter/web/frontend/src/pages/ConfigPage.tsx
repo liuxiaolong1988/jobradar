@@ -50,6 +50,7 @@ export default function ConfigPage() {
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>(() => ({
     profile: true,
     search: true,
+    notify: true,
     ...(requestedSection ? { [requestedSection]: true } : {}),
   }))
   const [resumeInfo, setResumeInfo] = useState<any>(null)
@@ -706,6 +707,132 @@ export default function ConfigPage() {
             </Field>
           </div>
         </SectionCard>
+
+        {/* Notify (Feishu) Section */}
+        <SectionCard title="飞书通知设置" sectionKey="notify" expanded={expandedSections} toggle={toggleSection}>
+          <NotifyPanel config={config} updateConfig={updateConfig} dirty={dirty} />
+        </SectionCard>
+    </div>
+  )
+}
+
+// -------- 飞书通知子面板 --------
+
+function NotifyPanel({
+  config,
+  updateConfig,
+  dirty,
+}: {
+  config: Record<string, any>
+  updateConfig: (path: string, value: any) => void
+  dirty: boolean
+}) {
+  const [testing, setTesting] = useState(false)
+  const [result, setResult] = useState<{ ok?: boolean; msg?: string } | null>(null)
+  const lark = (config.notify?.lark_app || {}) as Record<string, any>
+
+  const handleSendTest = async () => {
+    if (dirty) {
+      setResult({ ok: false, msg: '有未保存的更改：请先点右上角「保存」，再执行测试消息。' })
+      return
+    }
+    setTesting(true)
+    setResult(null)
+    try {
+      const res = await fetch('/api/notify/test', { method: 'POST' })
+      const data = await res.json()
+      setResult({
+        ok: Boolean(res.ok && data.success),
+        msg: (data.message || data.error || '未知错误').toString(),
+      })
+    } catch {
+      setResult({ ok: false, msg: '无法连接后端，请确认本地 BossHunter Web 正在运行。' })
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between rounded-xl border border-card-border bg-[#FFFCFA] px-3 py-2">
+        <div>
+          <label className="text-xs font-black text-foreground">启用飞书通知</label>
+          <p className="mt-1 text-xs text-muted">
+            监测到 HR 新回复 / 陌生 HR 主动联系时，优先走下面的自建应用私信发到你飞书手机端；应用未配置时回退到群机器人。
+          </p>
+        </div>
+        <Switch checked={config.notify?.enable ?? true} onChange={v => updateConfig('notify.enable', v)} />
+      </div>
+
+      <div className="rounded-2xl border border-primary/30 bg-[#FFFCFA] p-4">
+        <div className="text-sm font-black text-foreground">出口 1（推荐）· 飞书自建应用私信</div>
+        <p className="mt-1 text-xs text-muted">
+          以应用名义给你的飞书账号发私信。你在开放平台后台建好应用后，把 <code>App ID</code> / <code>App Secret</code> / 你的 <code>Open ID</code> 三项贴到下面。
+          应用需要开通 <code>im:message</code> 发消息权限。
+        </p>
+        <div className="mt-4 grid gap-4 md:grid-cols-3">
+          <Field label="App ID（形如 cli_xxxx）">
+            <Input
+              value={lark.app_id || ''}
+              onChange={e => updateConfig('notify.lark_app.app_id', e.target.value)}
+              placeholder="cli_xxxxxxxxxxxxxxxx"
+              autoComplete="off"
+            />
+          </Field>
+          <Field label="App Secret">
+            <Input
+              type="password"
+              value={lark.app_secret || lark.app_secret_masked || ''}
+              onChange={e => updateConfig('notify.lark_app.app_secret', e.target.value)}
+              placeholder="粘贴 App Secret，保存后不会明文回显"
+              autoComplete="new-password"
+            />
+          </Field>
+          <Field label="接收人 Open ID（形如 ou_xxxx）">
+            <Input
+              value={lark.open_id || ''}
+              onChange={e => updateConfig('notify.lark_app.open_id', e.target.value)}
+              placeholder="ou_xxxxxxxxxxxxxxxxxxxxxxxx"
+              autoComplete="off"
+            />
+          </Field>
+        </div>
+      </div>
+
+      <div className="rounded-2xl border border-card-border p-4">
+        <div className="text-sm font-black text-foreground">出口 2 · 群机器人 Webhook（没有上面三项时才使用）</div>
+        <p className="mt-1 text-xs text-muted">
+          兜底出口：在飞书群内添加「自定义机器人」后复制 webhook 粘贴到这里。消息会发到群里，而不是你个人私信。
+        </p>
+        <div className="mt-3">
+          <Field label="群机器人 Webhook URL">
+            <Input
+              type="password"
+              value={config.notify?.feishu_webhook_url || ''}
+              onChange={e => updateConfig('notify.feishu_webhook_url', e.target.value)}
+              placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxxxxxxxxxxxxxxxxxx"
+              autoComplete="off"
+            />
+          </Field>
+        </div>
+      </div>
+
+      <div className="rounded-2xl border border-card-border bg-[#FFFCFA] p-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="text-sm font-black text-foreground">发送测试消息</div>
+            <p className="mt-1 text-xs text-muted">先点右上角「保存」，保存成功后再点下面的按钮。</p>
+          </div>
+          <Button variant="secondary" size="sm" onClick={handleSendTest} disabled={testing}>
+            {testing ? '发送中...' : '发送测试消息'}
+          </Button>
+        </div>
+        {result && (
+          <p className={`mt-2 rounded-lg px-3 py-2 text-xs ${result.ok ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-500'}`}>
+            {result.msg}
+          </p>
+        )}
+      </div>
     </div>
   )
 }

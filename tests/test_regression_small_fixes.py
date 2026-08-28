@@ -429,12 +429,6 @@ class DashboardPageTests(unittest.TestCase):
         self.assertIn("setLastRefreshedAt", hook_source)
         self.assertIn("setWorkbench(prev => ({ ...prev, task, last_task: task }))", hook_source)
 
-    def test_dashboard_filters_today_jobs_and_clears_hidden_selection(self):
-        self.assertIn("filteredTodayJobs", self.source)
-        self.assertIn("setSelected(filteredTodayJobs.map(job => job.id))", self.source)
-        self.assertIn("visibleJobIds.has(id)", self.source)
-        self.assertIn("没有符合当前条件的岗位", self.source)
-
     def test_workbench_stats_distinguish_today_total_and_current_pending(self):
         self.assertIn("type StatsScope = 'today' | 'total'", self.source)
         self.assertIn("今日数据", self.source)
@@ -514,56 +508,6 @@ class DashboardPageTests(unittest.TestCase):
         self.assertIn("活跃度未知", jobs_table_source)
         self.assertIn("dateStr.replace(' ', 'T')", jobs_table_source)
         self.assertIn("`${dateStr.replace(' ', 'T')}Z`", jobs_table_source)
-
-    def test_dashboard_exposes_batch_reject_for_selected_pending_jobs(self):
-        # Arrange: DashboardPage source is loaded in setUp.
-
-        # Act / Assert
-        self.assertIn("rejectSelectedJobs", self.source)
-        self.assertIn("/api/workbench/reject", self.source)
-        self.assertIn("放弃已选", self.source)
-        self.assertIn("确定放弃这", self.source)
-        self.assertIn("setSelected(prev => prev.filter", self.source)
-
-    def test_each_pending_job_card_has_a_reject_action(self):
-        self.assertIn("onReject={() => rejectSelectedJobs([job.id])}", self.source)
-        self.assertIn("放弃岗位", self.source)
-
-    def test_dashboard_sends_ready_greetings_without_second_confirmation(self):
-        # Arrange: DashboardPage source is loaded in setUp.
-
-        # Act / Assert
-        self.assertIn("sendReadyGreetings", self.source)
-        self.assertIn("direct_send: true", self.source)
-        self.assertIn("已直接进入发送流程", self.source)
-        self.assertNotIn("confirmDeliver(pendingGreetingJobs.map", self.source)
-        self.assertNotIn("confirmDeliver([job.id])}>发送招呼语", self.source)
-        self.assertIn("已在当前发送队列中，请等待依次发送", self.source)
-        self.assertIn("追加到当前发送队列", self.source)
-
-    def test_dashboard_pending_greetings_can_be_rejected(self):
-        # Arrange: DashboardPage source is loaded in setUp.
-
-        # Act / Assert
-        self.assertIn("const pendingGreetingJobs = workbench.pending_greetings", self.source)
-        self.assertNotIn(
-            "workbench.pending_greetings.filter(job => !confirmedDeliveryIds.has(job.id))",
-            self.source,
-        )
-        self.assertIn("rejectSelectedJobs(pendingGreetingJobs.map(job => job.id))", self.source)
-        pending_section = self.source[self.source.index("待发送招呼语"):]
-        self.assertIn("rejectSelectedJobs([job.id])", pending_section)
-        self.assertIn(">放弃</Button>", pending_section)
-
-    def test_dashboard_send_errors_do_not_fake_an_active_full_task(self):
-        # Arrange: DashboardPage source is loaded in setUp.
-
-        # Act / Assert
-        self.assertNotIn("blockedFullTask", self.source)
-        self.assertNotIn("send-errors-blocked-full-flow", self.source)
-        self.assertNotIn("全流程卡在打招呼环节", self.source)
-        self.assertIn("放弃已失效岗位", self.source)
-        self.assertIn("放弃全部", self.source)
 
     def test_monitor_pending_replies_can_be_dismissed(self):
         # Arrange: DashboardPage source is loaded in setUp.

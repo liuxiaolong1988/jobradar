@@ -22,12 +22,19 @@ interface JobsTableProps {
   onSortChange: (sortBy: JobSortKey) => void
 }
 
+// 平台根域名白名单：boss 解锁跳转（我们走人工投递，需要回原页面）
+const PLATFORM_ROOT_DOMAINS: Record<string, string> = {
+  boss: 'zhipin.com',
+  zhilian: 'zhaopin.com',
+  '51job': '51job.com',
+}
+
 function safeExternalJobUrl(job: Job): string | null {
-  if (job.source_platform !== 'zhilian' && job.source_platform !== '51job') return null
+  const rootDomain = PLATFORM_ROOT_DOMAINS[job.source_platform ?? 'boss']
+  if (!rootDomain) return null
   try {
     const parsed = new URL(job.url || '')
     if (parsed.protocol !== 'https:') return null
-    const rootDomain = job.source_platform === 'zhilian' ? 'zhaopin.com' : '51job.com'
     if (parsed.hostname !== rootDomain && !parsed.hostname.endsWith(`.${rootDomain}`)) return null
     return parsed.toString()
   } catch {
@@ -131,7 +138,8 @@ export function JobsTable({ jobs, page, pageSize, total, onPageChange, selectedI
             <tbody>
               {jobs.map(job => {
                 const isExpanded = expanded === job.id
-                const isExternalPlatform = job.source_platform === 'zhilian' || job.source_platform === '51job'
+                // 改造版：BOSS 也走人工投递，跳转/手动标记按钮全平台开放
+                const isExternalPlatform = true
                 const externalUrl = safeExternalJobUrl(job)
                 const alreadySent = ['sent', 'replied', 'resume_sent', 'needs_resume', 'follow_up_sent'].includes(job.status)
                 return (

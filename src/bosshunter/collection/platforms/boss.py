@@ -11,6 +11,10 @@ from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import quote
 
+from rich.console import Console
+
+console = Console()
+
 from bosshunter.ai.prefilter import quick_score
 from bosshunter.browser import close_tab, evaluate, navigate, new_tab, scroll, wait_for_load
 from bosshunter.collection.base import CollectionError, CollectorHooks
@@ -52,14 +56,20 @@ JS_EXTRACT_DETAIL = """
 (() => {
     const info = {};
     info.title = document.querySelector('.info-primary .name h1')?.textContent?.trim()
-        || document.querySelector('.name h1')?.textContent?.trim()
+        || document.querySelector('h1')?.textContent?.trim()
         || document.title.split('-')[0]?.trim();
     info.salary = document.querySelector('.info-primary .salary')?.textContent?.trim()
         || document.querySelector('.salary')?.textContent?.trim() || '';
-    const tagItems = document.querySelectorAll('.info-primary .tag-list span');
-    const tagTexts = Array.from(tagItems).map(t => t.textContent.trim());
-    info.experience = tagTexts[0] || '';
-    info.education = tagTexts[1] || '';
+    // 经验/学历：优先实测有效选择器（.text-experiece 少个 n 是平台拼写），tag-list 兜底
+    info.experience = document.querySelector('.text-experiece')?.textContent?.trim() || '';
+    info.education = document.querySelector('.text-degree')?.textContent?.trim() || '';
+    if (!info.experience || !info.education) {
+        const tagItems = document.querySelectorAll('.info-primary .tag-list li, .info-primary .tag-list span');
+        const tagTexts = Array.from(tagItems).map(t => t.textContent.trim()).filter(Boolean);
+        if (!info.experience) info.experience = tagTexts[0] || '';
+        if (!info.education) info.education = tagTexts[1] || '';
+    }
+    info.city = document.querySelector('.text-city')?.textContent?.trim() || '';
     const pageText = document.body?.innerText || '';
     info.recruitment_type = /校招|校园招聘|应届|毕业生|管培生|实习生/.test(pageText)
         ? 'campus'
@@ -82,10 +92,17 @@ JS_EXTRACT_DETAIL = """
         if (text.includes('人')) info.company_size = text;
         else if (!info.company_industry) info.company_industry = text;
     });
-    const bossSection = document.querySelector('.boss-info-attr') || document.querySelector('.job-boss-info');
-    info.hr_name = bossSection?.querySelector('.name')?.textContent?.trim() || '';
+    // HR：优先 .job-boss-info（实测有效），.boss-info-attr 兜底；姓名清洗"在线/刚刚活跃"等状态词
+    const bossSection = document.querySelector('.job-boss-info') || document.querySelector('.boss-info-attr');
+    info.hr_name = (bossSection?.querySelector('.name')?.textContent?.trim() || '')
+        .replace(/\\s*(在线|刚刚活跃|今日活跃|活跃|在线中)\\s*$/g, '').trim();
     info.hr_title = bossSection?.querySelector('.title')?.textContent?.trim() || '';
-    info.hr_active = document.querySelector('.boss-active-time')?.textContent?.trim() || '';
+    if (!info.hr_title) {
+        // .job-boss-info 结构里 title 常在 .job-title 或姓名后缀里
+        info.hr_title = bossSection?.querySelector('.job-title')?.textContent?.trim() || '';
+    }
+    info.hr_active = document.querySelector('.boss-active-time')?.textContent?.trim()
+        || bossSection?.textContent?.match(/(在线|刚刚活跃|今日活跃|\\d+小时前活跃|\\d+天前活跃)/)?.[1] || '';
     info.url = window.location.pathname;
     return JSON.stringify(info);
 })()
@@ -235,6 +252,20 @@ class BossCollector:
                 )
             if guard is not None:
                 guard.lock(kind, minutes=pause_minutes)
+            # 登录失效：立即推飞书提醒用户去采集浏览器重新扫码（失败不影响采集主流程）
+            if kind == "login_required":
+                try:
+                    from bosshunter.notify import send_notification
+
+                    send_notification(
+                        self.config,
+                        "BOSS直聘登录已失效，采集已自动停止。\n"
+                        "请在工作台专用浏览器窗口打开 zhipin.com 重新扫码登录，\n"
+                        "登录完成后再手动重新发起采集。",
+                        title="智能求职 · 登录过期提醒",
+                    )
+                except Exception as exc:  # noqa: BLE001 - 通知异常不能影响采集主流程
+                    console.print(f"[yellow]登录失效飞书提醒发送失败（不影响主流程）: {exc}[/yellow]")
             return PlatformCollectionResult(
                 self.platform,
                 "blocked",
