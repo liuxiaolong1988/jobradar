@@ -247,7 +247,7 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
             return (
               <section key={platform} className={`rounded-2xl border p-4 ${draft.enabled ? 'border-primary/30 bg-[#FFFCFA]' : 'border-card-border bg-white opacity-70'}`}>
                 <div className="flex items-center justify-between gap-3">
-                  <label className="flex items-center gap-2 text-lg font-black"><input type="checkbox" checked={draft.enabled} disabled={mode === 'full' && platform !== 'boss'} onChange={event => togglePlatform(platform, event.target.checked)} className="h-4 w-4 accent-primary" />{label}</label>
+                  <label className="flex items-center gap-2 text-lg font-black"><input type="checkbox" checked={draft.enabled} onChange={event => togglePlatform(platform, event.target.checked)} className="h-4 w-4 accent-primary" />{label}</label>
                   {draft.enabled && <div className="text-xs font-bold text-primary">队列 {enabledOrder.indexOf(platform) + 1}</div>}
                 </div>
                 {draft.enabled && <div className="mt-4 space-y-3">
@@ -270,7 +270,7 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
                     <label className="text-xs font-bold text-muted">排序<Select value={draft.sort} onChange={event => updateDraft(platform, 'sort', event.target.value)}><option value="default">默认</option>{platform !== '51job' && <option value="newest">最新</option>}</Select></label>
                   </div>
                 </div>}
-                {!draft.enabled && mode === 'full' && platform !== 'boss' && <p className="mt-3 text-xs text-muted">当前只支持“岗位采集”，不进入发送全流程。</p>}
+                {!draft.enabled && <p className="mt-3 text-xs text-muted">勾选后加入本轮采集队列。</p>}
               </section>
             )
           })}
