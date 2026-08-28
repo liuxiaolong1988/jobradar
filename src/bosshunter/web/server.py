@@ -1563,6 +1563,75 @@ def api_jobs_permanent_delete():
 		db.close()
 
 
+# ─── Profile Template APIs（目标岗位画像）────────────────────
+
+def _load_profile_or_none():
+	from bosshunter.ai.profile import load_profile
+	return load_profile(DATA_DIR)
+
+
+@app.route("/api/profile")
+def api_profile_get():
+	"""读取画像；不存在返回 null（前端显示"未生成，可上传简历生成初版"）。"""
+	try:
+		template = _load_profile_or_none()
+		if template is None:
+			return _json_response(None)
+		from bosshunter.ai.profile import profile_to_dict
+		return _json_response(profile_to_dict(template))
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
+@app.route("/api/profile", method="POST")
+def api_profile_save():
+	"""保存画像（人工修订后保存）。"""
+	try:
+		data = request.json
+		if not isinstance(data, dict):
+			return _json_response({"error": "画像内容必须是 JSON 对象"}, 400)
+		from bosshunter.ai.profile import ProfileError, profile_from_dict, save_profile
+		try:
+			template = profile_from_dict(data)
+			path = save_profile(DATA_DIR, template)
+		except ProfileError as e:
+			return _json_response({"error": str(e)}, 400)
+		from bosshunter.ai.profile import profile_to_dict
+		return _json_response({"success": True, "message": "画像已保存，评分将按画像匹配", "path": str(path), "profile": profile_to_dict(template)})
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
+@app.route("/api/profile/generate", method="POST")
+def api_profile_generate():
+	"""简历 → AI 生成初版画像（不落盘，返回给前端预览，人工确认后再保存）。"""
+	try:
+		config = load_config(CONFIG_PATH)
+		resume_path = config.get("profile", {}).get("resume_path", "")
+		if not resume_path or not Path(resume_path).exists():
+			return _json_response({"error": "请先在配置页上传简历，再生成画像"}, 400)
+		resume_text = Path(resume_path).read_text(encoding="utf-8")
+		from bosshunter.ai.profile import ProfileError, generate_profile_from_resume, profile_to_dict
+		try:
+			template = generate_profile_from_resume(resume_text, config)
+		except ProfileError as e:
+			return _json_response({"error": str(e)}, 400)
+		return _json_response({"success": True, "message": "初版画像已生成，请检查并修订后保存", "profile": profile_to_dict(template)})
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
+@app.route("/api/profile", method="DELETE")
+def api_profile_delete():
+	"""删除画像：评分回退到'简历 vs JD'模式。"""
+	try:
+		from bosshunter.ai.profile import delete_profile
+		deleted = delete_profile(DATA_DIR)
+		return _json_response({"success": True, "message": "画像已删除，评分回退为简历匹配模式" if deleted else "画像不存在", "deleted": deleted})
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
 # ─── Resume APIs ─────────────────────────────────────────
 
 @app.route("/api/resume")

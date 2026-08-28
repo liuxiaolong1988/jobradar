@@ -1,9 +1,12 @@
 """AI Scorer - Match jobs against resume using Claude API."""
 
+from __future__ import annotations
+
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import json
 from pathlib import Path
+from typing import Any
 
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -23,7 +26,11 @@ from bosshunter.db import (
 from bosshunter.ai.prefilter import quick_score
 from bosshunter.scoring_selection import select_scoring_jobs, validate_options
 
+# 画像驱动评分（存在 profile_template.json 时启用；否则回退"简历 vs JD"）
+from bosshunter.ai.profile import DIMENSION_KEYS, load_profile
+
 console = Console()
+
 
 def get_scoring_concurrency(config: dict) -> int:
     """Return a conservative, user-configurable AI scoring worker count."""
@@ -89,6 +96,232 @@ REVIEW_PROMPT_SUFFIX = """
 下面是第一次评估结果。请重新核对简历证据与JD，不要迎合第一次结果；仍按上面的同一JSON结构输出各维度分数，不要输出总分。
 第一次评估：{first_result}
 """
+
+PROFILE_SCORING_PROMPT = """你是一位严谨的岗位价值评估员。候选人已定义"目标岗位画像"（他的择业标准）。
+你的任务：评估**这个岗位值得他投递的程度**——不是评估他能不能干（人岗匹配只作辅助参考）。
+
+## 候选人目标画像
+- 定位：{positioning}
+- 目标薪资：{salary_range}
+
+### 评分维度与权重（按权重给分）
+{dimension_rules}
+
+### 一票否决（命中任意一条，对应维度记 0 并在 veto_hit 里写明）
+{veto_rules}
+
+### 人岗匹配辅助（能力锚点，供核心职责维度参考：岗位核心职责与锚点重叠则加分，JD 硬性要求明显超出锚点证据则减分）
+{anchors}
+
+## 候选人简历（证据核对用，截选）
+{resume}
+
+## 岗位信息
+- 职位：{title}
+- 公司：{company}
+- 薪资：{salary}
+- 要求：{experience}
+- 学历要求：{education}
+- JD：{jd}
+
+## 评分规则
+逐项给分，不要自行输出总分；程序会按权重加权求和：
+1. title_match（0-{w_title}分）：岗位 title 与画像主 title 家族的匹配度。
+2. reporting（0-{w_report}分）：汇报线与职级（从 JD 措辞推断，如"向总经理汇报""统筹公司IT"）。
+3. industry_scenario（0-{w_industry}分）：行业、业务场景、转型阶段与画像偏好的匹配度。
+4. company_stage（0-{w_stage}分）：企业阶段、规模、文化信号与画像的匹配度。
+5. commute（0-{w_commute}分）：岗位地点与画像通勤圈（JD 无地点信息按中性给中低分）。
+6. salary（0-{w_salary}分）：薪资与画像区间匹配度（面议给中性分）。
+每个维度附 evidence（50字内，写 JD 中的依据）。
+7. ai_signal（0-{w_ai}分，附加分）：JD 含 AI/agent/智能化/数字化探索信号的分。
+
+## 输出
+严格输出一个 JSON 对象，不要 Markdown，不要额外说明。score 必须是整数且不超过各自上限：
+{{
+  "role_summary": "岗位核心工作概括（40字内）",
+  "title_match": {{"score": 0, "evidence": "…"}},
+  "reporting": {{"score": 0, "evidence": "…"}},
+  "industry_scenario": {{"score": 0, "evidence": "…"}},
+  "company_stage": {{"score": 0, "evidence": "…"}},
+  "commute": {{"score": 0, "evidence": "…"}},
+  "salary": {{"score": 0, "evidence": "…"}},
+  "ai_signal": {{"score": 0, "evidence": "…"}},
+  "veto_hit": ["命中的一票否决条目，无则空数组"],
+  "reason": "最关键的匹配判断（60字内）",
+  "missing": "画像要求但岗位未满足的关键项（40字内，没有则为空）"
+}}
+"""
+
+PROFILE_COMPONENT_BASE = 100  # 每个画像维度按满分基数给 AI，再加权折算
+
+
+def _build_profile_scoring_prompt(job: dict, resume: str, profile: Any, config: dict | None = None, *, compact: bool = False) -> str:
+    """画像驱动的评分 prompt：六维 + AI 信号附加分。"""
+    config = config or {}
+    resume_limit = 1200 if compact else 2400
+    jd_limit = 900 if compact else 2000
+
+    dim_names = {
+        "title_match": "title/职能匹配",
+        "reporting": "汇报线与职级",
+        "industry_scenario": "行业与场景",
+        "company_stage": "企业阶段与文化",
+        "commute": "通勤/区位",
+        "salary": "薪资",
+    }
+    total_weight = sum(profile.weights.values()) or 1
+    dimension_rules = []
+    for key in DIMENSION_KEYS:
+        weight = profile.weights.get(key, 0)
+        note = profile.dimension_notes.get(key, "")
+        pct = round(weight * 100 / total_weight)
+        dimension_rules.append(f"- {dim_names[key]}（权重 {pct}%）：{note}")
+    veto_rules = "\n".join(f"- {r}" for r in profile.veto_rules) or "-（无）"
+    veto_titles = "、".join(profile.veto_titles)
+    if veto_titles:
+        veto_rules += f"\n- title 命中以下任一关键词视为纯执行岗否决：{veto_titles}"
+    anchors = "\n".join(
+        f"- {a.get('name', '')}（{a.get('strength', '')}）：{a.get('evidence', '')}"
+        for a in profile.competence_anchors[:8]
+    ) or "-（无锚点，忽略人岗辅助参考）"
+
+    return PROFILE_SCORING_PROMPT.format(
+        positioning=profile.positioning or "未填写",
+        salary_range=profile.salary_range or "未填写",
+        dimension_rules="\n".join(dimension_rules),
+        veto_rules=veto_rules,
+        anchors=anchors,
+        resume=_truncate_prompt_text(resume, resume_limit),
+        title=job["title"],
+        company=job["company"],
+        salary=job["salary"],
+        experience=job["experience"],
+        education=job.get("education", "") or "未识别",
+        jd=_truncate_prompt_text(clean_job_description(job.get("jd", "")), jd_limit),
+        w_title=PROFILE_COMPONENT_BASE,
+        w_report=PROFILE_COMPONENT_BASE,
+        w_industry=PROFILE_COMPONENT_BASE,
+        w_stage=PROFILE_COMPONENT_BASE,
+        w_commute=PROFILE_COMPONENT_BASE,
+        w_salary=PROFILE_COMPONENT_BASE,
+        w_ai=int(profile.ai_signal_max_bonus),
+    )
+
+
+PROFILE_DIM_LABELS = {
+    "title_match": "职能",
+    "reporting": "汇报",
+    "industry_scenario": "行业",
+    "company_stage": "阶段",
+    "commute": "通勤",
+    "salary": "薪资",
+}
+
+
+def _validated_profile_result(text: str, profile: Any) -> ScoreResult | None:
+    """解析画像模式 AI 回复：六维 + AI 信号 → 加权总分。"""
+    result = _parse_score_response(text)
+    if not isinstance(result, dict):
+        return None
+    dim_scores: dict[str, int] = {}
+    for key in DIMENSION_KEYS:
+        value = result.get(key)
+        if not isinstance(value, dict):
+            return None
+        raw = value.get("score")
+        if isinstance(raw, bool):
+            return None
+        try:
+            score = int(raw)
+        except (TypeError, ValueError):
+            return None
+        if score != raw or not 0 <= score <= PROFILE_COMPONENT_BASE:
+            return None
+        dim_scores[key] = score
+
+    raw_ai = result.get("ai_signal", {})
+    ai_bonus = 0
+    if isinstance(raw_ai, dict):
+        raw_bonus = raw_ai.get("score")
+        try:
+            ai_bonus = int(raw_bonus)
+        except (TypeError, ValueError):
+            ai_bonus = 0
+        ai_bonus = max(0, min(ai_bonus, int(profile.ai_signal_max_bonus)))
+
+    summary_reason = str(result.get("reason") or "").strip()
+    if not summary_reason:
+        return None
+    missing = str(result.get("missing") or "").strip()
+
+    raw_veto = result.get("veto_hit", [])
+    veto_hits = [str(v) for v in raw_veto if str(v).strip()] if isinstance(raw_veto, list) else []
+
+    weights: dict[str, int] = profile.weights
+    total_weight = sum(weights.values()) or 1
+    weighted = sum(dim_scores[k] * weights.get(k, 0) for k in DIMENSION_KEYS) / total_weight
+
+    detail = "画像 " + " ".join(
+        f"{PROFILE_DIM_LABELS[k]}{dim_scores[k]}" for k in DIMENSION_KEYS
+    ) + (f" +AI{ai_bonus}" if ai_bonus else "")
+    if veto_hits:
+        final_score = 0
+        reason = f"一票否决: {'；'.join(veto_hits[:3])} | {detail} | {summary_reason}"
+    else:
+        final_score = min(round(weighted) + ai_bonus, 100)
+        reason = f"{detail} → {final_score} | {summary_reason}"
+    if missing:
+        reason = f"{reason} | 缺失: {missing}"
+    return ScoreResult(
+        score=final_score,
+        raw_score=final_score,
+        reason=reason,
+        components=dim_scores,
+        caps=(),
+        summary_reason=summary_reason,
+        missing=missing,
+        structured=True,
+    )
+
+
+def _request_profile_score(
+    job: dict,
+    resume: str,
+    profile: Any,
+    config: dict,
+    max_attempts: int,
+) -> ScoreOutcome:
+    """画像模式评分请求：失败重试同 legacy，但不做二次复核（结构独立）。"""
+    response: str | None = None
+    try:
+        response = _call_claude(_build_profile_scoring_prompt(job, resume, profile, config), config)
+    except AIRequestError as exc:
+        if exc.kind in {"token_quota", "rate_limit", "auth", "network", "request_failed", "context_limit", "output_limit", "output_truncated"}:
+            if exc.kind in {"token_quota", "rate_limit", "auth", "network", "request_failed"}:
+                return ScoreOutcome(pause_reason=exc.user_message)
+            return ScoreOutcome(failure_detail=exc.user_message)
+        return ScoreOutcome(pause_reason=exc.user_message)
+
+    result = _validated_profile_result(response, profile) if response else None
+    for attempt in range(2, max_attempts + 1):
+        if result is not None:
+            break
+        _notify(
+            config,
+            f"{job['company']}｜{job['title']} 未返回完整画像评分，正在重试（{attempt}/{max_attempts}）。",
+        )
+        try:
+            response = _call_claude(_build_profile_scoring_prompt(job, resume, profile, config), config)
+        except AIRequestError as retry_exc:
+            if retry_exc.kind in {"token_quota", "rate_limit", "auth", "network", "request_failed"}:
+                return ScoreOutcome(pause_reason=retry_exc.user_message)
+            response = None
+        result = _validated_profile_result(response, profile) if response else None
+
+    if result is None:
+        return ScoreOutcome(failure_detail="AI 未返回完整、可解析的画像评分 JSON")
+    return ScoreOutcome(result=result)
+
 
 COMPONENT_LIMITS = {
     "core_duties": 40,
@@ -388,6 +621,9 @@ def _request_score(
     max_attempts: int,
 ) -> ScoreOutcome:
     """Request and validate one primary assessment without touching the database."""
+    profile_template = config.get("_profile_template")
+    if profile_template is not None:
+        return _request_profile_score(job, resume, profile_template, config, max_attempts)
     ai_cfg = config.get("ai", {}) if isinstance(config.get("ai"), dict) else {}
     response: str | None = None
     try:
@@ -458,6 +694,10 @@ def _score_job_with_ai(
     if first is None or outcome.pause_reason:
         return outcome
 
+    if config.get("_profile_template") is not None:
+        # 画像模式暂不做二次复核（复核 prompt 按 legacy 五维结构编写）
+        return outcome
+
     ai_cfg = config.get("ai", {}) if isinstance(config.get("ai"), dict) else {}
     review_enabled = ai_cfg.get("scoring_second_review", False) is True
     if not review_enabled or not first.structured or not 68 <= first.score <= 79:
@@ -494,6 +734,18 @@ def score_jobs(
         if not resume:
             console.print("[red]无法读取简历文件[/red]")
             return 0, 0
+
+        # 画像模式：存在 profile_template.json 时注入（否则走 legacy 简历匹配）
+        data_dir = Path(config.get("_data_dir") or Path(__file__).resolve().parents[3] / "data")
+        profile_template = load_profile(data_dir)
+        if profile_template is not None:
+            config["_profile_template"] = profile_template
+            # 画像否决 title 并入预筛排除词（AI 前粗筛，省 token）
+            merged_breakers = list(dict.fromkeys(
+                [*config.get("profile", {}).get("deal_breakers", []), *profile_template.veto_titles]
+            ))
+            config.setdefault("profile", {})["deal_breakers"] = [b for b in merged_breakers if str(b).strip()]
+            _notify(config, f"画像模式评分：按'{profile_template.positioning[:40]}'的六维权重匹配")
 
         if rescore_filtered:
             reset_count = reset_ai_filtered_jobs(db)
