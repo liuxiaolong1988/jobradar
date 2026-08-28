@@ -379,6 +379,15 @@ def _log(task: WorkbenchTask, message: str) -> None:
 	task.logs.append(message)
 
 
+def _notify_task(task: WorkbenchTask, config: dict, text: str, *, title: str | None = None) -> None:
+	"""任务完成后的飞书通知（失败不影响主流程）。"""
+	try:
+		from bosshunter.notify import send_notification
+		send_notification(config, text, title=title)
+	except Exception as exc:
+		_log(task, f"飞书通知发送失败（不影响主流程）: {exc}")
+
+
 def _record_collect_progress(task: WorkbenchTask, state: dict) -> None:
 	task.metrics.update({
 		"collect_seen": int(state.get("seen") or 0),
@@ -407,7 +416,7 @@ def _record_score_progress(task: WorkbenchTask, state: dict) -> None:
 	)
 
 
-def _execute_collect(task: WorkbenchTask, config: dict) -> None:
+def _execute_collect(task: WorkbenchTask, config: dict, *, skip_notify: bool = False) -> None:
 	_log(task, "开始采集岗位")
 	collect_config = dict(config)
 	collect_config["_workbench_stop_event"] = task.stop_requested
@@ -452,6 +461,14 @@ def _execute_collect(task: WorkbenchTask, config: dict) -> None:
 		if boss_state.get("status") not in {None, "queued"}:
 			task.context["boss_collection_completed_monotonic"] = time.monotonic()
 	_log(task, f"本轮采集完成：新增 {len(result.get('collected_job_ids', []))}，状态 {result.get('status', 'completed')}")
+	# 单独采集完成后发飞书通知（全流程的通知在评分结束后统一发）
+	if not skip_notify:
+		platforms_summary = "、".join(
+			f"{('BOSS' if p == 'boss' else '智联' if p == 'zhilian' else '51job')}: 新增 {s.get('new', 0)}/重复 {s.get('duplicate', 0)}"
+			for p, s in (result.get("platforms") or {}).items()
+			if isinstance(s, dict) and s.get("status") not in {None, "queued"}
+		) or "无平台数据"
+		_notify_task(task, config, f"采集完成：新增 {len(result.get('collected_job_ids', []))} 个岗位\n{platforms_summary}", title="岗位采集完成")
 	if task.stop_requested.is_set():
 		return
 
@@ -489,6 +506,12 @@ def _execute_rescore(task: WorkbenchTask, config: dict) -> None:
 	score_config["_data_dir"] = str(DATA_DIR)  # 画像模式：score_jobs 依此加载 profile_template.json
 	_log(task, "开始重新评分")
 	score_jobs(score_config, rescore_filtered=True)
+	_notify_task(
+		task,
+		config,
+		f"重新评分完成：通过 {task.metrics.get('ai_passed', 0)} 个，过滤 {task.metrics.get('ai_filtered', 0)} 个",
+		title="重新评分完成",
+	)
 
 
 def _execute_score(task: WorkbenchTask, config: dict) -> None:
@@ -531,6 +554,12 @@ def _execute_score(task: WorkbenchTask, config: dict) -> None:
 	except Exception as exc:
 		update_scoring_run(db_path, run_id, status="failed", error=str(exc)[:1000])
 		raise
+	_notify_task(
+		task,
+		config,
+		f"评分完成：通过 {task.metrics.get('ai_passed', 0)} 个，过滤 {task.metrics.get('ai_filtered', 0)} 个",
+		title="AI 评分完成",
+	)
 
 
 def _execute_monitor(task: WorkbenchTask, config: dict, *, initial_cooldown: bool = False) -> None:
@@ -597,9 +626,19 @@ def _execute_full(task: WorkbenchTask, config: dict) -> None:
 		# Keep the legacy executor path available for callers/tests that supply
 		# an intentionally minimal config and replace collection externally.
 		full_collection_config.pop("_collection_options", None)
-	_execute_collect(task, full_collection_config)
+	_execute_collect(task, full_collection_config, skip_notify=True)
 	if task.stop_requested.is_set():
 		return
+	# 全流程：评分结束后统一发飞书通知（采集+评分一次到位）
+	scored = task.metrics.get("ai_passed", 0)
+	filtered = task.metrics.get("ai_filtered", 0)
+	total_new = task.metrics.get("collect_new", 0)
+	_notify_task(
+		task,
+		config,
+		f"全流程完成：采集新增 {total_new} 个岗位，评分通过 {scored} 个，过滤 {filtered} 个\n投递请在岗位池中手动跳转平台完成",
+		title="全流程完成",
+	)
 	_log(task, "全流程结束：采集与评分已完成；投递请在岗位池中手动跳转平台完成")
 
 

@@ -764,7 +764,7 @@ class WebApiRouteTests(unittest.TestCase):
         # Arrange
         calls = []
 
-        def fake_collect(task, config):
+        def fake_collect(task, config, **kwargs):
             calls.append("collect")
 
         runner = WorkbenchTaskRunner()
